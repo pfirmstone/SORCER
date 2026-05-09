@@ -263,61 +263,66 @@ that fall back to plain `ObjectInputStream`.
 #### 3.6.2 When Shared Serial Form Is Not Possible
 
 The shared-serial-form guarantee applies to the **outer class** annotated with `@AtomicSerial`.
-It breaks down in one important situation:
+It breaks down when a field's type does not implement `@AtomicSerial`.
 
-> **If a field's *type* does not itself implement `@AtomicSerial`, then deserialization of
-> that field's value falls back to plain Java Serialization, losing the atomicity guarantee
-> for that sub-object.**
-
-Concretely:
+`AtomicMarshalInputStream` is **not** a fallback to `ObjectInputStream.readObject()` for
+non-`@AtomicSerial` types — it is more restrictive. The exact behavior for each field-type
+category is:
 
 | Situation | Effect |
 |---|---|
-| Field type is `@AtomicSerial` | `AtomicMarshalInputStream` constructs it via `(GetArg)` constructor — safe |
-| Field type is `Serializable` but not `@AtomicSerial` | `AtomicMarshalInputStream` falls back to `ObjectInputStream.readObject()` — object created before invariant check |
-| Field type is a Java collection interface (`List`, `Map`, `Set`, …) | `AtomicMarshalOutputStream` replaces it with a serialiser wrapper; `(GetArg)` constructor receives a safe wrapper — defensive copy required (see §3.2) |
-| Field type is a JDK class (e.g. `String`, `Integer`, primitives, arrays of primitives) | Safe — these are handled atomically by the stream |
-| Field type is a third-party class (e.g. `net.jini.id.Uuid`, `javax.security.auth.Subject`) | Deserialized via plain Java Serialization unless that class also implements `@AtomicSerial` in JGDMS |
+| Field type is `@AtomicSerial` or `@AtomicExternal` | Constructed via `(GetArg)` / `readExternal()` constructor — fully safe |
+| Field type is `Serializable` with **only primitive fields** in its entire hierarchy (no `readObject`, no `readObjectNoData`, no object fields anywhere in the hierarchy) | Instantiated and primitive fields populated directly — safe. No `DeSerializationPermission` required. |
+| Field type is `Serializable` with **object fields** or a `readObject` / `readObjectNoData` method | **Rejected.** Under a `SecurityManager`: `AccessControlException` is thrown (`DeSerializationPermission` required). If `readObject` is found at any point: `InvalidObjectException("readObject method not supported")` is thrown. The outer `@AtomicSerial` class's `GetArg.get()` call fails. |
+| Field type is a Java collection interface (`List`, `Map`, `Set`, `SortedSet`, `Map`, `SortedMap`) | `AtomicMarshalOutputStream` replaces it with a serialiser wrapper; `(GetArg)` receives a safe immutable wrapper — defensive copy required (see §3.2) |
+| Field type is a JDK primitive, `String`, array of primitives | Safe — handled directly by the stream protocol |
+| Field type is `Externalizable` (but not `@AtomicExternal`) | Allowed if the class holds `DeSerializationPermission("EXTERNALIZABLE")` — `readExternal()` is called on a freshly constructed instance |
+
+> **Key consequence:** A non-`@AtomicSerial` `Serializable` class with object fields (e.g.
+> `javax.security.auth.Subject`, `SorcerPrincipal`) **cannot be deserialized** by
+> `AtomicMarshalInputStream`. The stream does not degrade gracefully — it throws an
+> exception, preventing the outer class from being constructed at all.
+> This is a migration blocker: all field types in an `@AtomicSerial` class's serial form
+> must themselves be `@AtomicSerial`, primitive-only `Serializable`, or a supported
+> collection/serialiser type.
 
 #### 3.6.3 Implications for the SORCER Migration
 
 Many SORCER wire classes hold fields of types that are outside SORCER's control and do
 not currently implement `@AtomicSerial`:
 
-| Common non-`@AtomicSerial` field type | Where it appears | Risk level |
+| Common non-`@AtomicSerial` field type | Where it appears | Impact on migration |
 |---|---|---|
-| `net.jini.id.Uuid` | `ServiceMogram.mogramId`, `parentId`, `sessionId` | Low — `Uuid` has simple serial form, no collections |
-| `javax.security.auth.Subject` | `ServiceMogram.subject`, `ServiceExertion.subject` | **High** — `Subject` holds `Set<Principal>` deserialized via plain OIS |
-| `net.jini.core.transaction.Transaction` | `ServiceExertion.transaction` | Medium — Transaction implementation is provider-specific |
-| `sorcer.security.util.SorcerPrincipal` | Many exertion classes | Medium — custom Principal, not `@AtomicSerial` |
-| Various third-party `Serializable` entries stored in `ServiceContext<T>` | `ServiceContext.data` values | **High** — map values are arbitrary |
+| `net.jini.id.Uuid` | `ServiceMogram.mogramId`, `parentId`, `sessionId` | Check if `Uuid` has only primitive serial form — if so, safe. If not, **blocks migration**. |
+| `javax.security.auth.Subject` | `ServiceMogram.subject`, `ServiceExertion.subject` | **Blocks migration** — `Subject` has `readObject()` and object fields; `AtomicMarshalInputStream` rejects it. Must be replaced with an `@AtomicSerial` wrapper or removed from the serial form. |
+| `net.jini.core.transaction.Transaction` | `ServiceExertion.transaction` | Depends on implementation class — if not `@AtomicSerial` with object fields, **blocks migration**. |
+| `sorcer.security.util.SorcerPrincipal` | Many exertion classes | **Blocks migration** if it has object fields or `readObject`. Must be converted to `@AtomicSerial`. |
+| Various third-party `Serializable` entries stored in `ServiceContext<T>` | `ServiceContext.data` values | **Blocks migration** for any value type with object fields or `readObject`. `T` must be constrained to `@AtomicSerial` or primitive-only `Serializable` types. |
 
-**Practical consequence:** Adding `@AtomicSerial` to `ServiceMogram` means:
-- The outer class's own fields (`name`, `mogramId`, `parentId`, …) are validated atomically.
-- The `Subject` field still goes through plain `ObjectInputStream.readObject()` — its `Set<Principal>` members may include attacker-controlled `Principal` objects.
-- The `ServiceContext<T>` map values are also arbitrary until `T` is constrained to `@AtomicSerial` types.
+**Practical consequence:** Adding `@AtomicSerial` to `ServiceMogram` is NOT sufficient if
+`Subject` is still in the serial form — deserialization of `ServiceMogram` itself will fail
+when `AtomicMarshalInputStream` encounters the `Subject` field.
 
-**Mitigation strategy for non-`@AtomicSerial` field types:**
+**Resolution strategy for non-`@AtomicSerial` field types:**
 
-1. **Use `Valid.isInstance(type, obj)` after reading** — this cannot prevent early
-   construction of the sub-object, but it does prevent the sub-object reference from
-   propagating further if it is the wrong type.
+1. **Use `@AtomicSerial` `Serializer` wrappers from JGDMS** — JGDMS ships `@AtomicSerial`
+   serializer implementations for several types (e.g. `X500PrincipalSerializer`,
+   `AccessControlContextSerializer`, `PermissionSerializer`). Check whether a wrapper exists
+   for the problematic type and use it in the serial form.
 
-2. **Treat the field value as untrusted** — even after reading, assume the object's
-   own invariants may not hold.  Validate any data extracted from it before use.
+2. **Convert the field type to `@AtomicSerial`** — if the type is in SORCER's codebase
+   (e.g. `SorcerPrincipal`), add `@AtomicSerial` support to it directly.
 
-3. **Prefer `@AtomicSerial` replacements in JGDMS** — JGDMS ships `@AtomicSerial`
-   implementations for several JERI and Jini types.  Where a replacement exists (e.g.,
-   JGDMS `SubjectSerializer` for `Subject` transport), use it.
+3. **Remove the field from the serial form** — if the field is not truly needed on the wire
+   (e.g. `Subject` could be re-established from the JERI dispatch context via `ClientSubject`),
+   remove it from `serialPersistentFields` / `serialForm()` and reconstruct it server-side.
 
-4. **Document the residual risk** — annotate each `@AtomicSerial` class that holds
-   non-`@AtomicSerial` field types with a `@SuppressWarnings` comment explaining which
-   fields are not fully guarded.
+4. **Change the field type in the serial form** — declare the serial form field as an
+   `@AtomicSerial` replacement type, and convert in `serialize()` / `(GetArg)` constructor.
 
-5. **Scope `DeSerializationPermission`** — if `AtomicMarshalInputStream` is configured
-   with a strict `DeSerializationPermission` whitelist, classes that do not hold the
-   permission are refused deserialization entirely.  This is the strongest mitigation for
-   untrusted sub-objects.
+5. **Use `DeSerializationPermission`** to explicitly allow specific trusted `Serializable`
+   classes that have only primitive fields — this is the no-migration path for classes that
+   are genuinely primitive-only and therefore safe.
 
 #### 3.6.4 Corrected `serialVersionUID` Guidance
 
@@ -537,9 +542,10 @@ begin in parallel.
     - **Do NOT change `serialVersionUID`** unless the serial form itself is also changed
       (see §3.6.4); the `@AtomicSerial` annotation shares the same wire format as
       Java Serialization
-    - For fields whose types do not implement `@AtomicSerial`, apply the mitigation
-      strategy in §3.6.3 (type check via `Valid.isInstance`, treat value as untrusted,
-      prefer JGDMS `@AtomicSerial` replacements where available)
+    - For fields whose types do not implement `@AtomicSerial` AND have object fields or
+      `readObject` (see §3.6.2): apply the resolution strategy in §3.6.3 — use JGDMS
+      serializer wrappers, convert the type, remove from serial form, or change the declared
+      type. These field types are migration **blockers**, not merely risks.
 
 16. **Convert Priority 2 and Priority 3 classes** (§4.2, §4.3)
 
@@ -575,8 +581,8 @@ begin in parallel.
 | `@AtomicSerial` check method called before `super()` | Ensures atomic failure — if invariants cannot be satisfied, no reference can be stolen |
 | `serialVersionUID` unchanged when adding `@AtomicSerial` to an existing class | `@AtomicSerial` shares the same serial form as Java Serialization; changing `serialVersionUID` would needlessly break compatibility with existing serialized instances |
 | `serialVersionUID` changed only when serial form changes | Bumping on a pure `@AtomicSerial` addition is incorrect; bump only when fields are added/removed/renamed alongside the migration |
-| Fields of non-`@AtomicSerial` types are treated as untrusted | `AtomicMarshalInputStream` falls back to plain `ObjectInputStream.readObject()` for sub-objects not annotated `@AtomicSerial`; the atomicity guarantee is limited to the outer class |
-| Prefer JGDMS `@AtomicSerial` replacements for JDK/Jini types | JGDMS ships `@AtomicSerial` versions of several JERI types; using them extends the safety boundary into sub-objects |
+| Fields of non-`@AtomicSerial` types are a **migration blocker** | `AtomicMarshalInputStream` does **not** fall back to `ObjectInputStream.readObject()`; non-`@AtomicSerial` types with object fields or `readObject` are **actively rejected** — they block deserialization of the outer class | Use JGDMS `@AtomicSerial` serializer wrappers, convert the type, remove from serial form, or replace with an `@AtomicSerial` equivalent (see §3.6.3) |
+| Prefer JGDMS `@AtomicSerial` replacements for JDK/Jini types | Without replacements, any `Serializable` field type with object fields or `readObject` is rejected; JGDMS ships `@AtomicSerial` serializers for `AccessControlContext`, `Permission`, `X500Principal`, etc. | Check the `org.apache.river.api.io` package for available serializer wrappers before writing custom ones |
 | `Subject.doAsPrivileged` → `Subject.callAs` for JAAS `LoginContext` path | DirtyChai v17+ rejects `WorkerSubject` in `doAs`; `callAs` binds to `SCOPED_SUBJECT` |
 | `doMethodAs()` removed; direct `checkPermission` used | DirtyChai's `getContext()` injects scoped user Subject principals automatically |
 | Executor-submitted tasks must capture and re-establish `Subject.currentAll()` | Executor tasks do not inherit `SCOPED_SUBJECT`; `new Thread()` inside `callAs` scope does (divergence from OpenJDK) |
@@ -592,7 +598,7 @@ begin in parallel.
 | Risk | Impact | Mitigation |
 |---|---|---|
 | `@AtomicSerial` migration changes the serial form | If serial form fields are added/removed at the same time as adding `@AtomicSerial`, existing serialized instances are incompatible | Keep serial form identical on first migration pass; add/remove fields in a separate, explicitly versioned step |
-| Non-`@AtomicSerial` field types reduce safety boundary | Sub-objects deserialized via plain `ObjectInputStream.readObject()` are not guarded atomically | Use `Valid.isInstance()` post-read; prefer JGDMS replacements; consider `DeSerializationPermission` whitelist |
+| Non-`@AtomicSerial` field types are migration blockers | Any field type with object fields or `readObject` that doesn't implement `@AtomicSerial` causes deserialization of the outer `@AtomicSerial` class to fail entirely — not a silent degradation | Identify all such field types before starting migration; convert or replace each one using the strategy in §3.6.3 |
 | DirtyChai replaces JDK classes (sealed `Subject` hierarchy) | Build and runtime must use DirtyChai JDK, not stock OpenJDK | Document JDK dependency in build; provide Docker/container image |
 | Rio integration | Rio `ServiceDiscoveryManager` may not align with JGDMS `ProxyCodebaseSpi` VerdictRegistry gate | Assess Rio separately; potentially bypass VerdictRegistry gate for Rio-managed services initially |
 | `ConcurrentHashMap` in `ServiceContext` — complex object graph | Hard to convert atomically without breaking the map's complex semantics | Convert in a dedicated PR; add extensive unit tests for round-trip serialization |
